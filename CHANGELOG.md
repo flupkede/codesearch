@@ -14,6 +14,17 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.8.25]
+
+### Fixed
+
+- Server publication rejects malformed notebooks without replacing prior index state, orders unique shared cache insertions to avoid reversed-key deadlocks, and provides bounded repository keyset pagination. Split chunks now retain inclusive physical source-line ranges, including fragments of long lines; notebook coordinates remain explicitly synthetic.
+- Server documents now preserve extracted documentation for BM25 and embeddings, with cache keys derived from final prepared input (including long-function split headers). The v2 document fingerprint refuses earlier databases until intentional reindex into a fresh database; no automatic reset/migration. Loopback HTTP now rejects hostile/malformed Host and browser Origin values before all routes, without adding authentication.
+
+### Added
+
+- Separate `codesearch-server` foundation for upstream #384 stage 2: loopback HTTP publication/search with PostgreSQL pgvector and pg_search 0.27.1, server-side embeddings and database embedding cache, persistent repository/file sync state, transactional replacement/deletion and stale-writer revision checks. The local CLI remains unchanged. This stage has no authentication and must not be exposed to untrusted callers; see `server/README.md`.
+
 ## [1.8.12]
 
 ### Added

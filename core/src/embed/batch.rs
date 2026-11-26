@@ -145,7 +145,7 @@ impl BatchEmbedder {
     /// - Signature (if available)
     /// - Docstring (if available)
     /// - Content
-    fn prepare_text(chunk: &Chunk, model_type: ModelType) -> String {
+    pub fn prepare_text(chunk: &Chunk, model_type: ModelType) -> String {
         let mut parts = Vec::new();
 
         // Add context breadcrumbs (e.g., "File: main.rs > Class: Server")

@@ -9,6 +9,10 @@ use anyhow::Result;
 use std::path::Path;
 use tree_sitter::Node;
 
+#[cfg(test)]
+#[path = "semantic_range_tests.rs"]
+mod range_tests;
+
 /// Smart semantic chunker using tree-sitter and language-specific extractors
 pub struct SemanticChunker {
     parser: CodeParser,
@@ -497,21 +501,21 @@ impl SemanticChunker {
 
         // 1. Expand into "units": one per line, but any line over the char budget is
         //    fragmented on char boundaries so no single unit exceeds max_chunk_chars.
-        let mut units: Vec<String> = Vec::new();
-        for line in chunk.content.lines() {
+        let mut units: Vec<(String, usize)> = Vec::new();
+        for (line_index, line) in chunk.content.lines().enumerate() {
             if line.len() <= self.max_chunk_chars {
-                units.push(line.to_string());
+                units.push((line.to_string(), line_index));
                 continue;
             }
             let mut frag = String::new();
             for ch in line.chars() {
                 if !frag.is_empty() && frag.len() + ch.len_utf8() > self.max_chunk_chars {
-                    units.push(std::mem::take(&mut frag));
+                    units.push((std::mem::take(&mut frag), line_index));
                 }
                 frag.push(ch);
             }
             if !frag.is_empty() {
-                units.push(frag);
+                units.push((frag, line_index));
             }
         }
 
@@ -530,18 +534,24 @@ impl SemanticChunker {
             let mut char_count = 0usize;
             while j < units.len()
                 && (j - i) < self.max_chunk_lines
-                && (j == i || char_count + units[j].len() < self.max_chunk_chars)
+                && (j == i || char_count + units[j].0.len() < self.max_chunk_chars)
             {
-                char_count += units[j].len() + 1;
+                char_count += units[j].0.len() + 1;
                 j += 1;
             }
             let end = if j > i { j } else { i + 1 };
 
-            let content = units[i..end].join("\n");
+            let mut content = units[i].0.clone();
+            for index in (i + 1)..end {
+                if units[index].1 != units[index - 1].1 {
+                    content.push('\n');
+                }
+                content.push_str(&units[index].0);
+            }
             let mut piece = Chunk::new(
                 content,
-                chunk.start_line + i,
-                chunk.start_line + end,
+                chunk.start_line + units[i].1,
+                chunk.start_line + units[end - 1].1,
                 chunk.kind,
                 chunk.path.clone(),
             );
@@ -591,7 +601,7 @@ impl SemanticChunker {
                 let mut split_chunk = Chunk::new(
                     content,
                     chunk.start_line + i,
-                    chunk.start_line + end,
+                    chunk.start_line + end - 1,
                     chunk.kind,
                     chunk.path.clone(),
                 );

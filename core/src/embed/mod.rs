@@ -10,6 +10,17 @@ pub use config::{active_config, configure, save_defaults, EmbedConfig};
 pub use identity::EmbeddingModel;
 pub use provider::Embedder;
 
+/// Construct a provider without opening a local index or embedding cache.
+/// Model artifacts for local inference remain managed by FastEmbedder.
+pub fn create_embedder(config: EmbedConfig, local_model: ModelType) -> Result<Box<dyn Embedder>> {
+    config.validate()?;
+    if config.remote() {
+        Ok(Box::new(openai::OpenAiEmbedder::new(config)?))
+    } else {
+        Ok(Box::new(FastEmbedder::with_model(local_model)?))
+    }
+}
+
 use anyhow::Result;
 #[allow(unused_imports)]
 // group_embedded_chunks_by_path unused in the bin target (lib facade consumes it)
