@@ -37,7 +37,7 @@ impl TestDatabase {
         self.admin.close().await;
     }
 }
-async fn boundary(state: &Simulated) -> Service {
+pub(super) async fn boundary(state: &Simulated) -> Service {
     serve(axum::Router::new().route("/v1/embeddings", post(embeddings)).with_state(state.clone())).await
 }
 async fn register(client: &reqwest::Client, service: &Service, name: &str) {
@@ -71,6 +71,13 @@ async fn long_function_rename_embeds_final_slices_and_reuses_identical_text() {
     let inputs = state.inputs.lock().unwrap().clone();
     assert_eq!(inputs.len(), count, "each changed final signature-bearing slice needs fresh inference; inputs: {inputs:?}");
     assert!(inputs.iter().all(|text| text.contains("renamedlong")));
+    for input in &inputs {
+        let text = input.strip_prefix("document:").unwrap();
+        let cached: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM cs_server_embedding_cache WHERE content_hash=$1)")
+            .bind(codesearch_core::chunker::Chunk::compute_hash(text))
+            .fetch_one(&db.pool).await.unwrap();
+        assert!(cached, "cache identity hashes exactly the representation supplied to provider");
+    }
     let hits = search(&client, &service, &["first"], "renamedlong", "vector", None).await;
     assert_eq!(hits.len(), count);
     assert!(hits.iter().all(|hit| hit["score"].as_f64().unwrap() > 0.999), "persisted vectors must match renamed inputs: {hits:?}");
@@ -102,6 +109,9 @@ async fn extracted_documentation_is_searchable_embedded_and_persisted() {
     let inputs = state.inputs.lock().unwrap().clone();
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs[0].matches("quasarneedle").count(), 1);
+    let document: String = sqlx::query_scalar("SELECT document FROM cs_server_chunks")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(inputs[0].strip_prefix("document:").unwrap(), document, "BM25 persistence and provider input share one representation");
     drop(service);
     let service = serve(router(db.store(&config).await)).await;
     state.fail.store(true, Ordering::SeqCst);
@@ -118,6 +128,29 @@ async fn extracted_documentation_is_searchable_embedded_and_persisted() {
     assert!(search(&client, &service, &["docs"], "quasarneedle", "keyword", None).await.is_empty());
     assert_eq!(search(&client, &service, &["docs"], "changedneedle", "keyword", None).await.len(), 1);
     drop(service);
+    drop(boundary);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PG18 with pg_search 0.27.1 + vector and CREATEDB"]
+async fn prior_document_representation_is_refused_without_mutation() {
+    let db = TestDatabase::new().await;
+    let state = Simulated::default();
+    let boundary = boundary(&state).await;
+    let mut config = config(&boundary.url);
+    config.embed_dimensions = Some(3);
+    let legacy = config.fingerprint();
+    db.pool.execute("CREATE TABLE cs_server_index (singleton boolean PRIMARY KEY CHECK(singleton), schema_version integer NOT NULL, fingerprint text NOT NULL, dimensions integer NOT NULL); CREATE TABLE retained_marker (value text); INSERT INTO retained_marker VALUES ('do not destroy')").await.unwrap();
+    sqlx::query("INSERT INTO cs_server_index VALUES (true,1,$1,3)").bind(&legacy).execute(&db.pool).await.unwrap();
+    let error = Store::connect(&db.url, Embedding::new(config, ModelType::default()).unwrap()).await.err().expect("old representation must require fresh database/reindex");
+    assert!(error.to_string().contains("mismatch"));
+    let recorded: String = sqlx::query_scalar("SELECT fingerprint FROM cs_server_index").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(recorded, legacy);
+    let marker: String = sqlx::query_scalar("SELECT value FROM retained_marker").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(marker, "do not destroy");
+    let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'cs_server_%'").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(tables, 1, "failed startup does not migrate/create index tables");
     drop(boundary);
     db.cleanup().await;
 }

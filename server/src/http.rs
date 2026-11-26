@@ -3,8 +3,9 @@ use crate::{
     MAX_FILE_BYTES,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    http::{header, uri::Authority, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -24,7 +25,54 @@ pub fn router(store: Store) -> Router {
         .route("/repositories/{name}/file", get(file))
         .route("/search", post(search))
         .layer(DefaultBodyLimit::max(MAX_FILE_BYTES * 2))
+        .layer(middleware::from_fn(loopback_boundary))
         .with_state(store)
+}
+// Parse an HTTP authority without URL normalization, DNS resolution, userinfo,
+// empty ports or ambiguous unbracketed IPv6. Never trust forwarded headers.
+fn loopback_authority(value: &str) -> bool {
+    let Ok(authority) = value.parse::<Authority>() else {
+        return false;
+    };
+    let host = authority.host();
+    let Some(suffix) = value.strip_prefix(host) else {
+        return false;
+    };
+    if !suffix.is_empty() {
+        let Some(port) = suffix.strip_prefix(':') else {
+            return false;
+        };
+        if port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || !port.parse::<u16>().is_ok_and(|port| port > 0)
+        {
+            return false;
+        }
+    }
+    let ip = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+async fn loopback_boundary(request: Request, next: Next) -> Response {
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let host = hosts.next();
+    let valid_host = match host {
+        Some(host) => host.to_str().is_ok_and(loopback_authority) && hosts.next().is_none(),
+        None => request.uri().authority().is_some(), // HTTP/2 :authority
+    };
+    let valid_authority = request.uri().authority().is_none_or(|value| loopback_authority(value.as_str()));
+    let mut origins = request.headers().get_all(header::ORIGIN).iter();
+    let valid_origin = match origins.next() {
+        None => true, // Native clients need not supply Origin.
+        Some(origin) => origin.to_str().is_ok_and(|origin| {
+            origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://"))
+                .is_some_and(loopback_authority)
+        }) && origins.next().is_none(),
+    };
+    if !valid_host || !valid_authority || !valid_origin {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error":"loopback Host and Origin required"}))).into_response();
+    }
+    next.run(request).await
 }
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
