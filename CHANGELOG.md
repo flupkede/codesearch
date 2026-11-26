@@ -18,6 +18,7 @@ finalized in place with a date — no renaming/migration step needed.
 
 ### Fixed
 
+- Server publication rejects malformed notebooks without replacing prior index state, orders unique shared cache insertions to avoid reversed-key deadlocks, and provides bounded repository keyset pagination. Split chunks now retain inclusive physical source-line ranges, including fragments of long lines; notebook coordinates remain explicitly synthetic.
 - Server documents now preserve extracted documentation for BM25 and embeddings, with cache keys derived from final prepared input (including long-function split headers). The v2 document fingerprint refuses earlier databases until intentional reindex into a fresh database; no automatic reset/migration. Loopback HTTP now rejects hostile/malformed Host and browser Origin values before all routes, without adding authentication.
 
 ### Added

@@ -9,7 +9,12 @@ use codesearch_core::file::Language;
 use pgvector::Vector;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{ConnectOptions, PgPool, Row};
-use std::{collections::{BTreeMap, BTreeSet}, path::Path, str::FromStr, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    str::FromStr,
+    time::Duration,
+};
 
 // Core's notebook extractor is deliberately best-effort. Publication must not
 // interpret an extraction failure as an intentional empty replacement. Validate
@@ -17,11 +22,19 @@ use std::{collections::{BTreeMap, BTreeSet}, path::Path, str::FromStr, time::Dur
 fn validate_notebook(content: &str) -> Result<()> {
     let invalid = || Error::Invalid("invalid notebook cells or source");
     let notebook: serde_json::Value = serde_json::from_str(content).map_err(|_| invalid())?;
-    let cells = notebook.get("cells").and_then(serde_json::Value::as_array).ok_or_else(invalid)?;
+    let cells = notebook
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(invalid)?;
     if !cells.iter().all(|cell| {
-        cell.get("cell_type").is_some_and(serde_json::Value::is_string)
+        cell.get("cell_type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| matches!(kind, "code" | "markdown" | "raw"))
             && cell.get("source").is_some_and(|source| {
-                source.is_string() || source.as_array().is_some_and(|parts| parts.iter().all(serde_json::Value::is_string))
+                source.is_string()
+                    || source
+                        .as_array()
+                        .is_some_and(|parts| parts.iter().all(serde_json::Value::is_string))
             })
     }) {
         return Err(invalid());
@@ -279,11 +292,15 @@ impl Store {
             chunks.iter().zip(&documents).zip(&vectors).enumerate()
         {
             sqlx::query("INSERT INTO cs_server_chunks(repo_id,path,ordinal,content,document,start_line,end_line,file_revision,source_revision,embedding) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
-                .bind(repo).bind(&state.path).bind(ordinal as i32).bind(&chunk.content).bind(&document.text).bind(chunk.start_line as i32).bind(chunk.end_line as i32).bind(revision).bind(&state.source_revision).bind(&vector).execute(&mut *tx).await?;
+                .bind(repo).bind(&state.path).bind(ordinal as i32).bind(&chunk.content).bind(&document.text).bind(chunk.start_line as i32).bind(chunk.end_line as i32).bind(revision).bind(&state.source_revision).bind(vector).execute(&mut *tx).await?;
         }
         // Global unique-key locks must be acquired in one order across repositories;
         // source chunk order is independent and can be reversed or repeat keys.
-        let cache: BTreeMap<_, _> = documents.iter().map(|document| &document.hash).zip(&vectors).collect();
+        let cache: BTreeMap<_, _> = documents
+            .iter()
+            .map(|document| &document.hash)
+            .zip(&vectors)
+            .collect();
         for (hash, vector) in cache {
             sqlx::query("INSERT INTO cs_server_embedding_cache(content_hash,embedding) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(hash).bind(vector).execute(&mut *tx).await?;
         }

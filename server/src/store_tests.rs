@@ -22,3 +22,31 @@ fn tls_verifies_by_default_and_only_explicit_parameter_overrides() {
         .to_string();
     assert!(!error.contains("secret-password"));
 }
+
+#[test]
+fn notebook_validation_distinguishes_empty_from_extraction_failure() {
+    for valid in [
+        r#"{"cells":[]}"#,
+        r#"{"cells":[{"cell_type":"code","source":"print(1)"}]}"#,
+        r##"{"cells":[{"cell_type":"markdown","source":["# Title","text"]}]}"##,
+        r#"{"cells":[{"cell_type":"raw","source":[]}]}"#,
+    ] {
+        assert!(validate_notebook(valid).is_ok(), "{valid}");
+    }
+    for invalid in [
+        "{",
+        "null",
+        "[]",
+        "{}",
+        r#"{"cells":null}"#,
+        r#"{"cells":{}}"#,
+        r#"{"cells":[null]}"#,
+        r#"{"cells":[{}]}"#,
+        r#"{"cells":[{"cell_type":1,"source":[] }]}"#,
+        r#"{"cells":[{"cell_type":"code","source":null}]}"#,
+        r#"{"cells":[{"cell_type":"typo","source":[]}]}"#,
+        r#"{"cells":[{"cell_type":"code","source":["valid",2]}]}"#,
+    ] {
+        assert!(validate_notebook(invalid).is_err(), "{invalid}");
+    }
+}

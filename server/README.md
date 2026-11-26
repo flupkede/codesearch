@@ -89,7 +89,7 @@ JSON, no MCP/federation compatibility surface:
 |---|---|---|
 | GET | `/health` | Liveness, explicit unauthenticated stage |
 | POST | `/repositories` | Register `{name,description}` (identical replay allowed; differing metadata conflicts) |
-| GET | `/repositories` | Metadata/revision list (up to 1000) |
+| GET | `/repositories?after=NAME&limit=100` | Ordered metadata/revision list; keyset pagination, max 1000 |
 | GET | `/repositories/NAME/files?after=PATH&limit=100` | Ordered file sync state including tombstones; keyset pagination, max 1000 |
 | GET | `/repositories/NAME/file?path=src%2Fmain.rs` | Exact file state, JSON null if never indexed |
 | PUT | `/repositories/NAME/files` | Atomic replacement or deletion |
@@ -113,6 +113,17 @@ Unknown repositories are errors, never silently omitted. `path_prefix` is a
 **literal** prefix applied before ranking/limit; `%` and `_` are not wildcards.
 Unknown input fields are rejected.
 
+Repository and file lists default to 100 rows, with `limit` from 1 to 1000.
+Start without `after`, then pass the last returned `name` (repositories) or
+`path` (files), URL-encoded, as `after` until an empty page. The cursor is
+exclusive; pages are ordered by that key. Traversal is not a multi-request
+snapshot when registrations/publications occur concurrently.
+
+Notebook publication requires valid JSON with a `cells` array and well-formed
+cell type/source fields (string source or array of strings). Malformed input
+returns HTTP 400 before inference or replacement; `{"cells":[]}` is an
+intentional valid empty publication. Notebook outputs/metadata are not indexed.
+
 `expected_revision=0` means never indexed. Each successful file update increments
 its revision, even deletion (`content:null`) or empty-file publication
 (`content:""`). The `content` field is required; omitting it returns HTTP 422,
@@ -130,13 +141,20 @@ preparation semantics. Documentation already inside source content is not added
 a second time. This same document is persisted for BM25 and supplied to the
 embedding provider; its SHA-256 is the cache key, not the chunker's pre-header
 hash. Provider query/document prefixes remain provider transformations guarded
-by the database fingerprint. Returned `content` and editor line bounds still
-describe the code chunk, not synthetic metadata or preceding documentation;
-a documentation-only hit may therefore return code without the matching comment.
+by the database fingerprint. Returned `content` and inclusive physical editor
+line bounds describe the code chunk, not synthetic headers/metadata or preceding
+documentation; fragments of one long source line retain the same line number.
+A documentation-only hit may therefore return code without the matching comment.
+**Notebook exception:** `.ipynb` line bounds are synthetic positions over extracted
+cell-content lines, not raw JSON editor coordinates; they are for display/order,
+not jump-to-source or source re-extraction. Files published before the split-range
+correction need deliberate republication/reindex to replace their persisted bounds.
 
 Chunking, validation and all embedding/cache lookups finish before deletion.
 A repository row lock then rechecks file CAS in the transaction. Cache entries,
 chunks, BM25 mutations, file sync state and repository revision commit together.
+Global cache insertions use sorted unique document hashes independently of source
+chunk order, so cross-repository publications acquire shared keys consistently.
 Provider and pre-commit SQL failures preserve the previous published file state.
 Transaction atomicity guarantees complete old or complete new state, never a
 partial replacement. A transport failure during COMMIT can leave the outcome
@@ -194,7 +212,10 @@ tombstone ABA, validation and unavailable storage returning an error. Regression
 also cover long-function renames/shared slices, same-document cache reuse,
 doc-only keyword/vector input, persisted documentation retrieval after restart,
 prior-representation refusal without mutation, and Host/Origin HTTP rejection
-before all routes. A physical
+before all routes. Additional cases cover invalid-notebook preservation, valid
+empty notebooks, physical split ranges, 1001-repository pagination, and a real
+PostgreSQL trigger enforcing sorted unique cache inserts during concurrent
+reversed-source publication (not a timing-based deadlock reproduction). A physical
 PostgreSQL/container crash/restart is an additional external qualification step;
 the test simulates interruption by terminating the publishing backend, not by
 claiming an in-process restart is a database crash.
