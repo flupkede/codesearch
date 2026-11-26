@@ -1,12 +1,12 @@
-# codesearch-server — PostgreSQL foundation
+# codesearch-server
 
-Upstream [#384](https://github.com/flupkede/codesearch/issues/384), stage 2.
-This is a separate runnable HTTP binary, not a storage mode for the local CLI.
+An HTTP server for code search with PostgreSQL-backed storage and server-side
+embedding. This is a separate binary, not a storage mode for the local CLI.
 `codesearch` and `codesearch-core` do not depend on SQLx or pgvector. The server
 reuses core chunking and embedding providers, **not** local LMDB/Tantivy indices,
 local embedding caches, the CLI registry, or client-side SQL integration.
 
-## Security and stage boundary
+## Security and supported capabilities
 
 **No authentication or authorization. Loopback only.** The binary refuses a
 non-loopback `--listen` address; default `127.0.0.1:39726`. Before all routes,
@@ -45,9 +45,8 @@ repositories and the PostgreSQL embedding cache share one recorded embedding
 fingerprint/dimension. A mismatch or unknown schema version fails startup.
 Changing model, dimensions, retrieval prefixes or server document representation
 requires a **separate database and reindex**, never an automatic destructive reset.
-The `server-documents-v2` fingerprint suffix intentionally refuses databases
-created by the earlier representation (including remote-provider databases).
-No compatibility migration or automatic deletion is performed. As in core, endpoint changes
+The database fingerprint includes the server document representation; incompatible
+representations are rejected without migration or automatic deletion. As in core, endpoint changes
 are allowed for the same model identity; operators must ensure the replacement
 endpoint really serves the same embedding space (an opaque model name cannot
 prove that). Endpoint URLs are not persisted as embedding identity.
@@ -87,7 +86,7 @@ JSON, no MCP/federation compatibility surface:
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Liveness, explicit unauthenticated stage |
+| GET | `/health` | Process liveness |
 | POST | `/repositories` | Register `{name,description}` (identical replay allowed; differing metadata conflicts) |
 | GET | `/repositories?after=NAME&limit=100` | Ordered metadata/revision list; keyset pagination, max 1000 |
 | GET | `/repositories/NAME/files?after=PATH&limit=100` | Ordered file sync state including tombstones; keyset pagination, max 1000 |
@@ -147,8 +146,8 @@ documentation; fragments of one long source line retain the same line number.
 A documentation-only hit may therefore return code without the matching comment.
 **Notebook exception:** `.ipynb` line bounds are synthetic positions over extracted
 cell-content lines, not raw JSON editor coordinates; they are for display/order,
-not jump-to-source or source re-extraction. Files published before the split-range
-correction need deliberate republication/reindex to replace their persisted bounds.
+not jump-to-source or source re-extraction. Republication replaces persisted
+content and bounds with those computed from the submitted source.
 
 Chunking, validation and all embedding/cache lookups finish before deletion.
 A repository row lock then rechecks file CAS in the transaction. Cache entries,
@@ -175,8 +174,8 @@ indexed content, line bounds, repository/path and file/source revisions.
 Storage/provider failures remain HTTP 503/502 rather than empty hits. No local
 cache or silent keyword fallback on vector failure. PostgreSQL statement/idle
 transaction timeouts are 30 seconds; pool maximum is eight connections. Exact
-vector scans and serialized provider access favor foundation correctness, not
-large-corpus performance. Cache retention/garbage collection and per-user
+vector scans and serialized provider access prioritize scoped retrieval correctness
+over large-corpus throughput. Cache retention/garbage collection and per-user
 resource quotas are deferred; this service is not safe for public exposure.
 
 ## Isolated behavioral qualification
