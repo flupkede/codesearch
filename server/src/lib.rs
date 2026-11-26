@@ -1,4 +1,5 @@
 //! PostgreSQL-backed, unauthenticated loopback HTTP foundation (upstream #384 stage 2).
+mod document;
 mod embedding;
 mod http;
 mod store;

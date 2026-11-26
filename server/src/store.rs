@@ -1,6 +1,6 @@
 use crate::types::fuse;
 use crate::{
-    Embedding, Error, FileState, FileUpdate, Repository, RepositoryInput, Result, SearchHit,
+    document::Document, Embedding, Error, FileState, FileUpdate, Repository, RepositoryInput, Result, SearchHit,
     SearchMode, SearchRequest, MAX_CHUNKS,
 };
 use anyhow::{bail, Context};
@@ -111,8 +111,8 @@ impl Store {
         sqlx::query("CREATE TABLE IF NOT EXISTS cs_server_repositories (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name text UNIQUE NOT NULL, description text NOT NULL, revision bigint NOT NULL DEFAULT 0 CHECK(revision >= 0))").execute(&mut *tx).await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS cs_server_files (repo_id bigint NOT NULL REFERENCES cs_server_repositories(id), path text NOT NULL, revision bigint NOT NULL CHECK(revision > 0), source_revision text NOT NULL, content_hash text, deleted boolean NOT NULL, chunk_count integer NOT NULL CHECK(chunk_count >= 0), PRIMARY KEY(repo_id,path))").execute(&mut *tx).await?;
         // Only a range-checked integer is interpolated; all runtime data is bound.
-        sqlx::query(&format!("CREATE TABLE IF NOT EXISTS cs_server_chunks (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, repo_id bigint NOT NULL, path text NOT NULL, ordinal integer NOT NULL, content text NOT NULL, start_line integer NOT NULL, end_line integer NOT NULL, file_revision bigint NOT NULL, source_revision text NOT NULL, embedding vector({}) NOT NULL, FOREIGN KEY(repo_id,path) REFERENCES cs_server_files(repo_id,path), UNIQUE(repo_id,path,ordinal))", self.embedding.dimensions)).execute(&mut *tx).await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS cs_server_chunks_search ON cs_server_chunks USING paradedb (id, repo_id, (content::pdb.source_code))").execute(&mut *tx).await?;
+        sqlx::query(&format!("CREATE TABLE IF NOT EXISTS cs_server_chunks (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, repo_id bigint NOT NULL, path text NOT NULL, ordinal integer NOT NULL, content text NOT NULL, document text NOT NULL, start_line integer NOT NULL, end_line integer NOT NULL, file_revision bigint NOT NULL, source_revision text NOT NULL, embedding vector({}) NOT NULL, FOREIGN KEY(repo_id,path) REFERENCES cs_server_files(repo_id,path), UNIQUE(repo_id,path,ordinal))", self.embedding.dimensions)).execute(&mut *tx).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS cs_server_chunks_search ON cs_server_chunks USING paradedb (id, repo_id, (document::pdb.source_code))").execute(&mut *tx).await?;
         sqlx::query(&format!("CREATE TABLE IF NOT EXISTS cs_server_embedding_cache (content_hash text PRIMARY KEY, embedding vector({}) NOT NULL)", self.embedding.dimensions)).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
@@ -185,14 +185,18 @@ impl Store {
         })
         .await
         .map_err(|_| Error::Invalid("chunking failed"))??;
+        let documents: Vec<_> = chunks
+            .iter()
+            .map(|chunk| Document::new(chunk, self.embedding.document_model))
+            .collect();
         let mut vectors = Vec::with_capacity(chunks.len());
         let mut misses = Vec::new();
         let mut miss_indices = Vec::new();
-        for (index, chunk) in chunks.iter().enumerate() {
+        for (index, document) in documents.iter().enumerate() {
             let cached: Option<Vector> = sqlx::query_scalar(
                 "SELECT embedding FROM cs_server_embedding_cache WHERE content_hash=$1",
             )
-            .bind(&chunk.hash)
+            .bind(&document.hash)
             .fetch_optional(&self.pool)
             .await?;
             match cached {
@@ -203,7 +207,7 @@ impl Store {
                 }
                 None => {
                     vectors.push(Vec::new());
-                    misses.push(chunk.content.clone());
+                    misses.push(document.text.clone());
                     miss_indices.push(index);
                 }
             }
@@ -247,11 +251,11 @@ impl Store {
             .bind(&state.path)
             .execute(&mut *tx)
             .await?;
-        for (ordinal, (chunk, vector)) in chunks.iter().zip(vectors).enumerate() {
+        for (ordinal, ((chunk, document), vector)) in chunks.iter().zip(documents).zip(vectors).enumerate() {
             let vector = Vector::from(vector);
-            sqlx::query("INSERT INTO cs_server_chunks(repo_id,path,ordinal,content,start_line,end_line,file_revision,source_revision,embedding) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
-                .bind(repo).bind(&state.path).bind(ordinal as i32).bind(&chunk.content).bind(chunk.start_line as i32).bind(chunk.end_line as i32).bind(revision).bind(&state.source_revision).bind(&vector).execute(&mut *tx).await?;
-            sqlx::query("INSERT INTO cs_server_embedding_cache(content_hash,embedding) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(&chunk.hash).bind(&vector).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO cs_server_chunks(repo_id,path,ordinal,content,document,start_line,end_line,file_revision,source_revision,embedding) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+                .bind(repo).bind(&state.path).bind(ordinal as i32).bind(&chunk.content).bind(&document.text).bind(chunk.start_line as i32).bind(chunk.end_line as i32).bind(revision).bind(&state.source_revision).bind(&vector).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO cs_server_embedding_cache(content_hash,embedding) VALUES ($1,$2) ON CONFLICT DO NOTHING").bind(&document.hash).bind(&vector).execute(&mut *tx).await?;
         }
         sqlx::query("UPDATE cs_server_repositories SET revision=revision+1 WHERE id=$1")
             .bind(repo)
@@ -303,7 +307,7 @@ impl Store {
             sqlx::query("SET LOCAL plan_cache_mode=force_custom_plan")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query_as::<_, SearchHit>("SELECT c.id,r.name AS repository,c.path,c.content,c.start_line,c.end_line,c.file_revision,c.source_revision,pdb.score(c.id)::double precision AS score FROM cs_server_chunks c JOIN cs_server_repositories r ON r.id=c.repo_id WHERE c.content ||| $1::text AND c.repo_id=ANY($2::bigint[]) AND ($3::text IS NULL OR left(c.path,length($3))=$3) ORDER BY pdb.score(c.id) DESC,c.id LIMIT $4")
+            sqlx::query_as::<_, SearchHit>("SELECT c.id,r.name AS repository,c.path,c.content,c.start_line,c.end_line,c.file_revision,c.source_revision,pdb.score(c.id)::double precision AS score FROM cs_server_chunks c JOIN cs_server_repositories r ON r.id=c.repo_id WHERE c.document ||| $1::text AND c.repo_id=ANY($2::bigint[]) AND ($3::text IS NULL OR left(c.path,length($3))=$3) ORDER BY pdb.score(c.id) DESC,c.id LIMIT $4")
                 .bind(&request.query).bind(&ids).bind(&request.path_prefix).bind(candidates).fetch_all(&mut *tx).await?
         } else {
             Vec::new()

@@ -1,13 +1,13 @@
 use super::*;
 
-struct TestDatabase {
+pub(super) struct TestDatabase {
     admin: sqlx::PgPool,
     pool: sqlx::PgPool,
     name: String,
     url: String,
 }
 impl TestDatabase {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let options: sqlx::postgres::PgConnectOptions = std::env::var("CODESEARCH_TEST_DATABASE_URL")
             .expect("set disposable CODESEARCH_TEST_DATABASE_URL")
             .parse()
@@ -28,10 +28,10 @@ impl TestDatabase {
         pool.execute("CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_search CASCADE").await.unwrap();
         Self { admin, pool, name, url: options.to_url_lossy().to_string() }
     }
-    async fn store(&self, config: &EmbedConfig) -> Store {
+    pub(super) async fn store(&self, config: &EmbedConfig) -> Store {
         Store::connect(&self.url, Embedding::new(config.clone(), ModelType::default()).unwrap()).await.unwrap()
     }
-    async fn cleanup(self) {
+    pub(super) async fn cleanup(self) {
         self.pool.close().await;
         self.admin.execute(format!("DROP DATABASE {} WITH (FORCE)", self.name).as_str()).await.unwrap();
         self.admin.close().await;
