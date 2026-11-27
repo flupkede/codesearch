@@ -802,7 +802,7 @@ repo_status() {
 # deltas. 600s x (5 vendors + custom-kb) leaves ample room for restore, tar and
 # upload inside that ceiling.
 wait_repo_ready() {
-  local name="$1" base="${API_BASE}" waited=0 body st="" warned_readonly=0
+  local name="$1" base="${API_BASE}" waited=0 body st="" warned_readonly=0 last_poke=-300
   sleep 5   # let the 202 flip the repo into "indexing" before we start checking
   while [ "${waited}" -lt "${INDEX_JOB_REPO_READY_SECS}" ]; do
     body="$(api "${base}/status" 2>/dev/null || true)"
@@ -819,6 +819,17 @@ wait_repo_ready() {
             log "      so its HNSW graph is not being built. Still polling; this will time out."
           fi ;;
       esac
+      # The idle reaper closes repos that saw no tool call for
+      # REPO_IDLE_TIMEOUT_SECS (30 min default). A repo that warmed early can
+      # be reaped while later vendors still build — and a reaped repo reads as
+      # "idle" forever, because nothing reopens it on its own. Poke it back
+      # open with an incremental reindex (a no-op when there are no deltas);
+      # bounded to one poke per 5 minutes so a live reindex is not 409-spammed.
+      if [ "$((waited - last_poke))" -ge 300 ]; then
+        last_poke="${waited}"
+        log "repo '${name}' not ready yet (status=${st:-?}) — poking a reopen"
+        api_code -X POST "${base}/repos/${name}/reindex" >/dev/null 2>&1 || true
+      fi
     fi
     sleep 10; waited=$((waited + 10))
   done
