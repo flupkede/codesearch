@@ -491,6 +491,28 @@ verify_index_ready() {
   esac
 }
 
+# A restored index built by an older binary can carry chunks whose HNSW graph
+# this binary no longer loads: the store opens (chunks survive, repo reaches
+# warm) but /info reports indexed=false, and a zero-delta incremental refresh
+# never rebuilds a graph. POST /reindex?force=true wipes and re-embeds the
+# corpus, committing a fresh-format graph. Safe ONLY after warmup released the
+# write lock — mid-warmup this same call 500s on "locked by another codesearch
+# process", which is why rebuild_repo never issues it for a registered repo.
+repair_vendor_graph() {
+  local name="$1" base="${API_BASE}" resp code
+  log "vendor '${name}': index has no usable graph — forcing a full rebuild (old vector format)"
+  resp="$(api_code -X POST "${base}/repos/${name}/reindex?force=true" || true)"
+  code="${resp##*$'\n'}"
+  case "${code}" in
+    200|201|202) log "force rebuild accepted for '${name}' (HTTP ${code})" ;;
+    409) log "rebuild already in progress for '${name}' (HTTP 409) — will wait for it" ;;
+    *) log "WARN: force reindex request for '${name}' failed — HTTP ${code:-<none>}: ${resp%$'\n'*}"
+       return 1 ;;
+  esac
+  wait_repo_ready "${name}" || return 1
+  verify_index_ready "${name}" || return 1
+}
+
 # A vendor whose index came up EMPTY after warmup (0 chunks / 0 files) is dead
 # weight: a ghost whose source vanished (but whose folder still holds stray
 # non-index files prune_ghost_vendors conservatively keeps), or a stale/corrupt
@@ -887,16 +909,19 @@ run_index_job() {
     #   empty     → best-effort prune (see prune_dead_vendor) and skip; a single
     #               dead vendor must not veto the batch, which also carries every
     #               healthy vendor's fresh deltas. Only die if NONE are healthy.
-    #   no graph  → FATAL. The index has content but is unsearchable, and unlike
-    #               "empty" this is not the vendor's fault — pruning it would
-    #               silently delete a healthy corpus to work around a build
-    #               failure, and uploading it would publish a dead index over a
-    #               good snapshot. Abort and keep the previous snapshot.
+    #   no graph  → one force-reindex repair attempt (old-format graph from a
+    #               pre-upgrade snapshot), then FATAL — never publish an
+    #               unsearchable index over a good snapshot, and never prune a
+    #               healthy corpus to work around a build failure.
     vrc=0; verify_index_ready "${vname}" || vrc=$?
     case "${vrc}" in
       0) found=1 ;;
       "${VERIFY_EMPTY}") prune_dead_vendor "${vname}" ;;
-      *) die "vendor '${vname}' has chunks but no HNSW graph — refusing to upload an unsearchable index over the good snapshot" ;;
+      "${VERIFY_NO_GRAPH}")
+        repair_vendor_graph "${vname}" \
+          || die "vendor '${vname}': force rebuild could not produce a searchable index — refusing to upload over the good snapshot"
+        found=1 ;;
+      *) die "vendor '${vname}': unexpected verify state (${vrc}) — refusing to snapshot" ;;
     esac
   done
   [ "${found}" -eq 1 ] \
@@ -905,10 +930,12 @@ run_index_job() {
     rebuild_repo "${KB_DIR}"
     wait_repo_ready "$(basename "${KB_DIR}")" \
       || die "custom-kb never became ready within ${INDEX_JOB_REPO_READY_SECS}s — refusing to snapshot a possibly mid-warmup index over the good one"
-    # custom-kb is not prunable — it is the curated corpus, so ANY verify failure
-    # (empty or missing graph) aborts rather than publishing over a good snapshot.
+    # custom-kb is not prunable — it is the curated corpus. An old-format graph
+    # gets one force-reindex repair; anything still failing aborts rather than
+    # publishing over a good snapshot.
     verify_index_ready "$(basename "${KB_DIR}")" \
-      || die "index verification failed for custom-kb (empty or no HNSW graph) — refusing to upload over the good snapshot"
+      || repair_vendor_graph "$(basename "${KB_DIR}")" \
+      || die "index verification failed for custom-kb (empty or no HNSW graph even after a force rebuild) — refusing to upload over the good snapshot"
   fi
   # Stop the local serve BEFORE snapshotting. upload_snapshot tar's the index
   # dir; a live serve can touch LMDB/tantivy files mid-archive → tar exits 1
