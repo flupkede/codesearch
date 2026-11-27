@@ -225,18 +225,30 @@ sync_kb() {
     # by moving a fresh clone's metadata in, then hard-reset the restored files
     # onto the fresh HEAD. Without this, restore would leave the KB frozen:
     # pulls need .git and a clone refuses a non-empty target directory.
-    local tmp="${KB_DIR}.reinit"
+    local tmp="${KB_DIR}.reinit" attempt
     log "git re-attach KB -> ${KB_DIR}"
-    rm -rf "${tmp}"
-    if kb_git clone --depth 1 "${url}" "${tmp}" 2>&1 | sed 's/^/[git] /' \
-      && mv "${tmp}/.git" "${KB_DIR}/.git" \
-      && rm -rf "${tmp}" \
-      && kb_git -C "${KB_DIR}" clean -fdq -e .codesearch.db 2>&1 | sed 's/^/[git] /' \
-      && kb_git -C "${KB_DIR}" reset --hard -q origin/HEAD 2>&1 | sed 's/^/[git] /'
-    then
-      :
+    rm -rf "${tmp}" 2>/dev/null || true   # a prior failed re-attach left it behind
+    if kb_git clone --depth 1 "${url}" "${tmp}" 2>&1 | sed 's/^/[git] /'; then
+      # Windows: AV/Search-indexer transiently holds handles on a fresh .git
+      # (os error 5/32/33 class) — bounded retry, a real failure still falls
+      # through to the WARN. Without the retry one race freezes KB updates
+      # until the next restore, because the clone above also fails into a
+      # leftover .reinit next boot.
+      for attempt in 1 2 3 4 5; do
+        if mv "${tmp}/.git" "${KB_DIR}/.git" 2>/dev/null; then break; fi
+        sleep 1
+      done
+      if [ -d "${KB_DIR}/.git" ] \
+        && kb_git -C "${KB_DIR}" clean -fdq -e .codesearch.db 2>&1 | sed 's/^/[git] /' \
+        && kb_git -C "${KB_DIR}" reset --hard -q origin/HEAD 2>&1 | sed 's/^/[git] /'
+      then
+        log "ok: KB git metadata re-attached"
+      else
+        log "WARN: could not re-attach KB git metadata — KB updates stay frozen until this is fixed"
+      fi
+      rm -rf "${tmp}" 2>/dev/null || true
     else
-      log "WARN: could not re-attach KB git metadata — KB updates stay frozen until this is fixed"
+      log "WARN: KB re-attach clone failed — KB updates stay frozen until this is fixed"
       rm -rf "${tmp}" 2>/dev/null || true
     fi
   else
@@ -288,13 +300,16 @@ restore_snapshot() {
       find "${DATA_DIR}" \( -name '.writer.lock' -o -name '.tantivy-writer.lock' \
         -o -name '.tantivy-meta.lock' -o -name 'lock.mdb' \) -delete 2>/dev/null || true
       # GHSA-pxrc-5gh7-28qj: pre-fix versions captured the tokenized origin URL
-      # into repos_meta.git_remote. Strip embedded userinfo so a restored
-      # snapshot's repos.json is clean before serve reads or re-persists it.
-      if [ -f "${CONFIG_DIR}/repos.json" ] && \
-         grep -q '://[^"/]*@' "${CONFIG_DIR}/repos.json" 2>/dev/null; then
-        sed -i -E 's#(https?://)[^/@]+@#\1#g' "${CONFIG_DIR}/repos.json"
-        log "scrubbed embedded credentials from repos.json (GHSA-pxrc-5gh7-28qj heal)"
-      fi
+      # into repos_meta.git_remote. Strip embedded userinfo from repos.json AND
+      # its save-time .bak twin (save_to copies the on-disk file to .bak), so a
+      # restored snapshot is clean before serve reads or re-persists either.
+      for _rj in "${CONFIG_DIR}/repos.json" "${CONFIG_DIR}/repos.json.bak"; do
+        if [ -f "${_rj}" ] && grep -q '://[^"/]*@' "${_rj}" 2>/dev/null; then
+          sed -i -E 's#(https?://)[^/@]+@#\1#g' "${_rj}"
+          log "scrubbed embedded credentials from ${_rj##*/} (GHSA-pxrc-5gh7-28qj heal)"
+        fi
+      done
+      unset _rj
       SNAPSHOT_RESTORED=1
       log "snapshot restored"
       return 0
@@ -499,7 +514,16 @@ verify_index_ready() {
 # write lock — mid-warmup this same call 500s on "locked by another codesearch
 # process", which is why rebuild_repo never issues it for a registered repo.
 repair_vendor_graph() {
-  local name="$1" base="${API_BASE}" resp code
+  local name="$1" base="${API_BASE}" resp code info indexed
+  # One re-ask before the wipe: an unparsable /info (transient 500/reset) also
+  # lands here as VERIFY_NO_GRAPH, and a needless wipe costs a veeva-class
+  # ~45 min re-embed. indexed=true on the re-ask → graph present after all.
+  info="$(api "${base}/repos/${name}/info" 2>/dev/null || true)"
+  indexed="$(json_field "${info}" indexed)"
+  if [ "${indexed}" = "true" ]; then
+    log "vendor '${name}': /info recovered — graph present after all, skipping the wipe"
+    return 0
+  fi
   log "vendor '${name}': index has no usable graph — forcing a full rebuild (old vector format)"
   resp="$(api_code -X POST "${base}/repos/${name}/reindex?force=true" || true)"
   code="${resp##*$'\n'}"
