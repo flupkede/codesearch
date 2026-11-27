@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.8.24]
+
+### Added
+
+- **`codesearch hooks opencode install`**: the OpenCode integration now has a one-command installer, mirroring `hooks claude install`. The plugin (`integrations/opencode/codesearch.ts`) is embedded in the binary at compile time, so a machine without a source checkout gets the full wiring — user scope (`~/.config/opencode/plugins/`) by default, `--project` for `.opencode/plugins/`. A rerun overwrites the file with the binary's own copy; previously the plugin could only be installed by a manual copy from a source checkout.
+
 ## [1.8.12]
 
 ### Added

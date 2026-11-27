@@ -75,8 +75,21 @@ remain in effect.
 
 ## Install
 
-The plugin is a single file. Drop it into OpenCode's plugin directory and
-restart, or point at it from `opencode.jsonc`.
+The plugin is a single file. The shipped binary can install it itself; otherwise
+drop it into OpenCode's plugin directory and restart, or point at it from
+`opencode.jsonc`.
+
+### One command (preferred, recent builds)
+
+```sh
+codesearch hooks opencode install          # user scope
+codesearch hooks opencode install --project  # this repository only (.opencode/plugins)
+```
+
+The plugin is embedded in the binary, so no source checkout is needed. A rerun
+overwrites the file with the binary's own copy.
+
+### Manual copy
 
 ### User scope (applies to every project)
 

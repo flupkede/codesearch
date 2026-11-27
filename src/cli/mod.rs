@@ -252,6 +252,12 @@ pub enum HookCommands {
         #[command(subcommand)]
         command: HookClaudeCommands,
     },
+    /// Manage the OpenCode integration (the auto-loaded TS plugin)
+    #[command(name = "opencode")]
+    OpenCode {
+        #[command(subcommand)]
+        command: HookOpenCodeCommands,
+    },
     /// Native edit-guard PreToolUse hook: read the Claude Code event JSON
     /// on stdin, emit the deny decision when the edit needs a codesearch
     /// consultation (silent allow otherwise; always exits 0 — fail-open).
@@ -300,6 +306,17 @@ pub enum HookClaudeCommands {
     /// Install the Claude Code PreToolUse guard hooks (codesearch-first) into settings.json
     Install {
         /// Install into the project's ./.claude instead of the user-level ~/.claude
+        #[arg(long)]
+        project: bool,
+    },
+}
+
+/// `hooks opencode` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum HookOpenCodeCommands {
+    /// Install the OpenCode plugin (codesearch.ts) into the auto-loaded plugins dir
+    Install {
+        /// Install into the project's ./.opencode instead of the user-level ~/.config/opencode
         #[arg(long)]
         project: bool,
     },
@@ -1538,6 +1555,11 @@ pub async fn run(cancel_token: CancellationToken) -> Result<()> {
                     claude_hooks::run_claude_install(project)
                 }
             },
+            HookCommands::OpenCode { command } => match command {
+                HookOpenCodeCommands::Install { project } => {
+                    opencode_hooks::run_opencode_install(project)
+                }
+            },
             // Native guard hooks: never exit non-zero, so the arms swallow
             // everything and return Ok.
             HookCommands::EditGuard => {
@@ -2370,6 +2392,7 @@ pub(crate) fn refresh_codesearch_post_checkout_hook(
 pub mod claude_hooks;
 pub mod doctor;
 pub mod hook_guard;
+pub mod opencode_hooks;
 pub mod setup;
 
 #[cfg(test)]
