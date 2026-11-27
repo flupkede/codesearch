@@ -287,6 +287,14 @@ restore_snapshot() {
       # open; the app-level *.lock files are pure stale-guards.
       find "${DATA_DIR}" \( -name '.writer.lock' -o -name '.tantivy-writer.lock' \
         -o -name '.tantivy-meta.lock' -o -name 'lock.mdb' \) -delete 2>/dev/null || true
+      # GHSA-pxrc-5gh7-28qj: pre-fix versions captured the tokenized origin URL
+      # into repos_meta.git_remote. Strip embedded userinfo so a restored
+      # snapshot's repos.json is clean before serve reads or re-persists it.
+      if [ -f "${CONFIG_DIR}/repos.json" ] && \
+         grep -q '://[^"/]*@' "${CONFIG_DIR}/repos.json" 2>/dev/null; then
+        sed -i -E 's#(https?://)[^/@]+@#\1#g' "${CONFIG_DIR}/repos.json"
+        log "scrubbed embedded credentials from repos.json (GHSA-pxrc-5gh7-28qj heal)"
+      fi
       SNAPSHOT_RESTORED=1
       log "snapshot restored"
       return 0
@@ -359,8 +367,10 @@ wait_healthz() {
 #   - ALREADY REGISTERED (index restored from a prior snapshot): do NOT issue any
 #     reindex here. serve's Phase-1 STARTUP WARMUP already opens the repo in write
 #     mode and runs an incremental refresh (re-embedding only added/changed/removed
-#     docs) the moment serve starts — and it holds the LMDB write lock for the whole
-#     refresh. A competing POST /repos/<alias>/reindex opens a SECOND write handle on
+#     docs) the moment serve starts (the job mode pins CODESEARCH_WARMUP_MAX_AGE_DAYS=0
+#     so the age gate cannot skip restored repos) — and it holds the LMDB write lock
+#     for the whole refresh. A competing POST /repos/<alias>/reindex opens a SECOND
+#     write handle on
 #     the same LMDB env and fails with HTTP 500 "locked by another codesearch
 #     process" (observed). So we let the warmup own the refresh and simply wait for
 #     the repo to reach a ready ("warm") state. During warmup /status reports the
@@ -831,6 +841,13 @@ run_index_job() {
   # that turns a documented workaround into silent corruption.
   export CODESEARCH_MAX_INDEXING_SECS="$((INDEX_JOB_REPO_READY_SECS + 300))"
   log "pinned CODESEARCH_MAX_INDEXING_SECS=${CODESEARCH_MAX_INDEXING_SECS} (readiness budget ${INDEX_JOB_REPO_READY_SECS}s + 300s margin)"
+
+  # The startup warmup skips repos whose recorded access times are older than
+  # CODESEARCH_WARMUP_MAX_AGE_DAYS (default 5) — right for interactive serve,
+  # fatal here: a restored snapshot always breaches the gate, so every repo
+  # stays 'idle' and wait_repo_ready can never succeed. The job waits for
+  # readiness, so the gate must be off.
+  export CODESEARCH_WARMUP_MAX_AGE_DAYS="${CODESEARCH_WARMUP_MAX_AGE_DAYS:-0}"
 
   # Run serve locally (no ingress needed) just to drive the indexing API.
   codesearch serve --host 127.0.0.1 --port "${PORT}" --no-tui --quiet=false &
