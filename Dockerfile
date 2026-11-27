@@ -34,6 +34,9 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY core ./core
 COPY server ./server
+# [patch.crates-io] in Cargo.toml redirects rmcp to the vendored copy; cargo
+# refuses to resolve when the patch path is missing from the build context.
+COPY vendor ./vendor
 # Hook scripts are embedded at compile time via include_str! in
 # src/cli/claude_hooks.rs (path ../../integrations/claude-code/hooks/*). They
 # MUST be present in the build context or the release compile fails with

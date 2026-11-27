@@ -8,6 +8,9 @@ helpers/
 docs/
 tests/
 **/*.md
+# rmcp's lib does include_str!("../README.md") — the vendored crate cannot
+# compile without it.
+!vendor/rmcp/README.md
 # Hidden tool dirs
 .*/
 **/.*/
