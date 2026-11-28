@@ -107,6 +107,80 @@ fn captures_git_remote_on_register() {
 }
 
 #[test]
+fn strip_userinfo_variants() {
+    let cases = [
+        (
+            "https://user:pat@example.com/acme/repo.git",
+            "https://example.com/acme/repo.git",
+        ),
+        (
+            "https://pat@example.com/acme/repo.git",
+            "https://example.com/acme/repo.git",
+        ),
+        (
+            "https://example.com/acme/repo.git",
+            "https://example.com/acme/repo.git",
+        ),
+        // '@' inside the path is not a userinfo block.
+        (
+            "https://example.com/o@r/repo.git",
+            "https://example.com/o@r/repo.git",
+        ),
+        // scp-like syntax has no scheme; nothing to strip.
+        (
+            "git@github.com:acme/repo.git",
+            "git@github.com:acme/repo.git",
+        ),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(strip_userinfo(input), expected, "input: {input}");
+    }
+}
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "same git-subprocess flake profile as captures_git_remote_on_register on Windows"
+)]
+fn register_strips_embedded_credentials() {
+    let _serial = git_serial_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_git_remote(&repo, "https://hunter2pat@example.com/acme/repo.git");
+
+    let mut cfg = ReposConfig::default();
+    let alias = cfg.register(repo);
+    assert_eq!(
+        cfg.meta(&alias).git_remote.as_deref(),
+        Some("https://example.com/acme/repo.git")
+    );
+}
+
+#[test]
+fn reconcile_strips_stored_git_remote_credentials() {
+    // A repos.json written by a pre-fix build can carry the tokenized origin
+    // URL; reconcile must neutralize it on load. Plain dir (no .git) so the
+    // captured remote is None and register itself stays git-flake-free.
+    let _serial = git_serial_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+
+    let mut cfg = ReposConfig::default();
+    let alias = cfg.register(repo.clone());
+    cfg.meta_mut(&alias).git_remote =
+        Some("https://hunter2pat@example.com/acme/repo.git".to_string());
+
+    cfg.reconcile();
+
+    assert_eq!(
+        cfg.meta(&alias).git_remote.as_deref(),
+        Some("https://example.com/acme/repo.git")
+    );
+}
+
+#[test]
 fn register_derives_alias_from_directory_name() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("My.Cool-Repo");

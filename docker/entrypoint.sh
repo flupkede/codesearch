@@ -31,6 +31,12 @@
 # Optional env:
 #   CODESEARCH_RUN_MODE       "serve" (default) | "index-job".
 #   KB_GIT_URL / GIT_PAT      Curated KB git repo (cloned to /data/custom-kb).
+#                             GIT_PAT is fed to git per command (kb_git) and is
+#                             NEVER spliced into a URL: git stores the remote URL
+#                             in .git/config and snapshots archive DATA_DIR, so a
+#                             tokenized URL there would ship the PAT in every
+#                             uploaded snapshot. GIT_USER overrides the credential
+#                             username (default x-access-token; e.g. oauth2 for GitLab).
 #   KB_POLL_INTERVAL_SECS     serve mode: how often to CHEAPLY poll the KB remote
 #                             HEAD (git ls-remote — ref advertisement only, no
 #                             objects). On a change, pull + incremental reindex fire
@@ -174,18 +180,80 @@ sync_blob() {
   fi
 }
 
+# Run git with the KB credentials supplied per command, never spliced into a URL.
+# Why: git persists the remote URL in .git/config, and upload_snapshot() archives
+# the whole DATA_DIR — a tokenized URL there would ship the PAT inside every
+# uploaded snapshot (GHSA-pxrc-5gh7-28qj). The throwaway credential helper reads
+# GIT_PAT straight from the environment when git asks for it: nothing lands in
+# .git/config, argv or any file. GIT_TERMINAL_PROMPT=0 fails fast instead of
+# hanging the container on a username prompt when credentials are rejected.
+kb_git() {
+  if [ -z "${GIT_PAT:-}" ]; then
+    git "$@"
+  else
+    GIT_TERMINAL_PROMPT=0 git \
+      -c credential.helper= \
+      -c 'credential.helper=!f() { printf "username=%s\npassword=%s\n" "${GIT_USER:-x-access-token}" "${GIT_PAT}"; }; f' \
+      "$@"
+  fi
+}
+
+# The stored remote URL must stay clean (see kb_git). If KB_GIT_URL itself was
+# configured with embedded credentials, strip the userinfo from https URLs and
+# warn rather than persisting it: auth comes from GIT_PAT only.
+kb_clean_url() {
+  case "${KB_GIT_URL}" in
+    https://*@*)
+      log "WARN: KB_GIT_URL embeds credentials — stripping them (auth comes from GIT_PAT via the per-command helper)" >&2
+      printf '%s' "${KB_GIT_URL}" | sed -E 's#^(https://)[^/@]+@#\1#' ;;
+    *) printf '%s' "${KB_GIT_URL}" ;;
+  esac
+}
+
 sync_kb() {
   [ -n "${KB_GIT_URL:-}" ] || return 0
-  local url="${KB_GIT_URL}"
-  if [ -n "${GIT_PAT:-}" ]; then
-    url="$(printf '%s' "${KB_GIT_URL}" | sed -E "s#^https://#https://${GIT_PAT}@#")"
-  fi
+  local url
+  url="$(kb_clean_url)"
   if [ -d "${KB_DIR}/.git" ]; then
+    # A clone restored from a pre-fix snapshot can still carry a tokenized
+    # remote.origin.url; reset it to the clean URL so the PAT never persists.
+    kb_git -C "${KB_DIR}" remote set-url origin "${url}" 2>/dev/null || true
     log "git pull KB -> ${KB_DIR}"
-    git -C "${KB_DIR}" pull --ff-only 2>&1 | sed 's/^/[git] /' || log "WARN: git pull failed"
+    kb_git -C "${KB_DIR}" pull --ff-only 2>&1 | sed 's/^/[git] /' || log "WARN: git pull failed"
+  elif [ -d "${KB_DIR}" ] && [ -n "$(ls -A "${KB_DIR}" 2>/dev/null)" ]; then
+    # Working tree without .git (snapshots exclude it since this fix): re-attach
+    # by moving a fresh clone's metadata in, then hard-reset the restored files
+    # onto the fresh HEAD. Without this, restore would leave the KB frozen:
+    # pulls need .git and a clone refuses a non-empty target directory.
+    local tmp="${KB_DIR}.reinit" attempt
+    log "git re-attach KB -> ${KB_DIR}"
+    rm -rf "${tmp}" 2>/dev/null || true   # a prior failed re-attach left it behind
+    if kb_git clone --depth 1 "${url}" "${tmp}" 2>&1 | sed 's/^/[git] /'; then
+      # Windows: AV/Search-indexer transiently holds handles on a fresh .git
+      # (os error 5/32/33 class) — bounded retry, a real failure still falls
+      # through to the WARN. Without the retry one race freezes KB updates
+      # until the next restore, because the clone above also fails into a
+      # leftover .reinit next boot.
+      for attempt in 1 2 3 4 5; do
+        if mv "${tmp}/.git" "${KB_DIR}/.git" 2>/dev/null; then break; fi
+        sleep 1
+      done
+      if [ -d "${KB_DIR}/.git" ] \
+        && kb_git -C "${KB_DIR}" clean -fdq -e .codesearch.db 2>&1 | sed 's/^/[git] /' \
+        && kb_git -C "${KB_DIR}" reset --hard -q origin/HEAD 2>&1 | sed 's/^/[git] /'
+      then
+        log "ok: KB git metadata re-attached"
+      else
+        log "WARN: could not re-attach KB git metadata — KB updates stay frozen until this is fixed"
+      fi
+      rm -rf "${tmp}" 2>/dev/null || true
+    else
+      log "WARN: KB re-attach clone failed — KB updates stay frozen until this is fixed"
+      rm -rf "${tmp}" 2>/dev/null || true
+    fi
   else
     log "git clone KB -> ${KB_DIR}"
-    git clone --depth 1 "${url}" "${KB_DIR}" 2>&1 | sed 's/^/[git] /' || log "WARN: git clone failed"
+    kb_git clone --depth 1 "${url}" "${KB_DIR}" 2>&1 | sed 's/^/[git] /' || log "WARN: git clone failed"
   fi
 }
 
@@ -231,6 +299,17 @@ restore_snapshot() {
       # open; the app-level *.lock files are pure stale-guards.
       find "${DATA_DIR}" \( -name '.writer.lock' -o -name '.tantivy-writer.lock' \
         -o -name '.tantivy-meta.lock' -o -name 'lock.mdb' \) -delete 2>/dev/null || true
+      # GHSA-pxrc-5gh7-28qj: pre-fix versions captured the tokenized origin URL
+      # into repos_meta.git_remote. Strip embedded userinfo from repos.json AND
+      # its save-time .bak twin (save_to copies the on-disk file to .bak), so a
+      # restored snapshot is clean before serve reads or re-persists either.
+      for _rj in "${CONFIG_DIR}/repos.json" "${CONFIG_DIR}/repos.json.bak"; do
+        if [ -f "${_rj}" ] && grep -q '://[^"/]*@' "${_rj}" 2>/dev/null; then
+          sed -i -E 's#(https?://)[^/@]+@#\1#g' "${_rj}"
+          log "scrubbed embedded credentials from ${_rj##*/} (GHSA-pxrc-5gh7-28qj heal)"
+        fi
+      done
+      unset _rj
       SNAPSHOT_RESTORED=1
       log "snapshot restored"
       return 0
@@ -242,8 +321,12 @@ restore_snapshot() {
 upload_snapshot() {
   [ -n "${SNAPSHOT_SAS_URL:-}" ] || { log "no SNAPSHOT_SAS_URL — skipping upload"; return 0; }
   log "creating index snapshot (excluding model weights)"
-  # Exclude model weights (baked into the image) and lock files (never valid to
-  # carry across containers — see restore_snapshot for why).
+  # Exclude model weights (baked into the image), lock files (never valid to
+  # carry across containers — see restore_snapshot for why) and .git metadata:
+  # the KB clone's .git dir must never ride along in a snapshot. Pre-fix images
+  # stored the GIT_PAT inside it (tokenized remote.origin.url —
+  # GHSA-pxrc-5gh7-28qj), and sync_kb re-attaches fresh metadata on restore,
+  # so nothing needs it.
   #
   # tar exits 1 ("Some files differ" / "file changed as we read it") when ANY
   # tracked file is touched mid-archive — common when snapshotting an index the
@@ -256,6 +339,7 @@ upload_snapshot() {
   tar czf "${SNAPSHOT_LOCAL}" -C / \
     --exclude='*.onnx' --exclude='*.onnx_data' \
     --exclude='*.lock' --exclude='lock.mdb' \
+    --exclude='.git' \
     "${DATA_DIR#/}" "${CONFIG_DIR#/}" 2>"${SNAPSHOT_LOCAL}.tarerr" || tar_err=$?
   if [ "${tar_err}" -ge 2 ]; then
     log "WARN: snapshot tar failed (exit ${tar_err}): $(tr '\n' ' ' < "${SNAPSHOT_LOCAL}.tarerr" 2>/dev/null)"
@@ -298,8 +382,10 @@ wait_healthz() {
 #   - ALREADY REGISTERED (index restored from a prior snapshot): do NOT issue any
 #     reindex here. serve's Phase-1 STARTUP WARMUP already opens the repo in write
 #     mode and runs an incremental refresh (re-embedding only added/changed/removed
-#     docs) the moment serve starts — and it holds the LMDB write lock for the whole
-#     refresh. A competing POST /repos/<alias>/reindex opens a SECOND write handle on
+#     docs) the moment serve starts (the job mode pins CODESEARCH_WARMUP_MAX_AGE_DAYS=0
+#     so the age gate cannot skip restored repos) — and it holds the LMDB write lock
+#     for the whole refresh. A competing POST /repos/<alias>/reindex opens a SECOND
+#     write handle on
 #     the same LMDB env and fails with HTTP 500 "locked by another codesearch
 #     process" (observed). So we let the warmup own the refresh and simply wait for
 #     the repo to reach a ready ("warm") state. During warmup /status reports the
@@ -418,6 +504,37 @@ verify_index_ready() {
       log "        restored snapshot, not from a finished build. Refusing to guess."
       return "${VERIFY_NO_GRAPH}" ;;
   esac
+}
+
+# A restored index built by an older binary can carry chunks whose HNSW graph
+# this binary no longer loads: the store opens (chunks survive, repo reaches
+# warm) but /info reports indexed=false, and a zero-delta incremental refresh
+# never rebuilds a graph. POST /reindex?force=true wipes and re-embeds the
+# corpus, committing a fresh-format graph. Safe ONLY after warmup released the
+# write lock — mid-warmup this same call 500s on "locked by another codesearch
+# process", which is why rebuild_repo never issues it for a registered repo.
+repair_vendor_graph() {
+  local name="$1" base="${API_BASE}" resp code info indexed
+  # One re-ask before the wipe: an unparsable /info (transient 500/reset) also
+  # lands here as VERIFY_NO_GRAPH, and a needless wipe costs a veeva-class
+  # ~45 min re-embed. indexed=true on the re-ask → graph present after all.
+  info="$(api "${base}/repos/${name}/info" 2>/dev/null || true)"
+  indexed="$(json_field "${info}" indexed)"
+  if [ "${indexed}" = "true" ]; then
+    log "vendor '${name}': /info recovered — graph present after all, skipping the wipe"
+    return 0
+  fi
+  log "vendor '${name}': index has no usable graph — forcing a full rebuild (old vector format)"
+  resp="$(api_code -X POST "${base}/repos/${name}/reindex?force=true" || true)"
+  code="${resp##*$'\n'}"
+  case "${code}" in
+    200|201|202) log "force rebuild accepted for '${name}' (HTTP ${code})" ;;
+    409) log "rebuild already in progress for '${name}' (HTTP 409) — will wait for it" ;;
+    *) log "WARN: force reindex request for '${name}' failed — HTTP ${code:-<none>}: ${resp%$'\n'*}"
+       return 1 ;;
+  esac
+  wait_repo_ready "${name}" || return 1
+  verify_index_ready "${name}" || return 1
 }
 
 # A vendor whose index came up EMPTY after warmup (0 chunks / 0 files) is dead
@@ -709,7 +826,7 @@ repo_status() {
 # deltas. 600s x (5 vendors + custom-kb) leaves ample room for restore, tar and
 # upload inside that ceiling.
 wait_repo_ready() {
-  local name="$1" base="${API_BASE}" waited=0 body st="" warned_readonly=0
+  local name="$1" base="${API_BASE}" waited=0 body st="" warned_readonly=0 last_poke=-300
   sleep 5   # let the 202 flip the repo into "indexing" before we start checking
   while [ "${waited}" -lt "${INDEX_JOB_REPO_READY_SECS}" ]; do
     body="$(api "${base}/status" 2>/dev/null || true)"
@@ -726,6 +843,17 @@ wait_repo_ready() {
             log "      so its HNSW graph is not being built. Still polling; this will time out."
           fi ;;
       esac
+      # The idle reaper closes repos that saw no tool call for
+      # REPO_IDLE_TIMEOUT_SECS (30 min default). A repo that warmed early can
+      # be reaped while later vendors still build — and a reaped repo reads as
+      # "idle" forever, because nothing reopens it on its own. Poke it back
+      # open with an incremental reindex (a no-op when there are no deltas);
+      # bounded to one poke per 5 minutes so a live reindex is not 409-spammed.
+      if [ "$((waited - last_poke))" -ge 300 ]; then
+        last_poke="${waited}"
+        log "repo '${name}' not ready yet (status=${st:-?}) — poking a reopen"
+        api_code -X POST "${base}/repos/${name}/reindex" >/dev/null 2>&1 || true
+      fi
     fi
     sleep 10; waited=$((waited + 10))
   done
@@ -771,6 +899,13 @@ run_index_job() {
   export CODESEARCH_MAX_INDEXING_SECS="$((INDEX_JOB_REPO_READY_SECS + 300))"
   log "pinned CODESEARCH_MAX_INDEXING_SECS=${CODESEARCH_MAX_INDEXING_SECS} (readiness budget ${INDEX_JOB_REPO_READY_SECS}s + 300s margin)"
 
+  # The startup warmup skips repos whose recorded access times are older than
+  # CODESEARCH_WARMUP_MAX_AGE_DAYS (default 5) — right for interactive serve,
+  # fatal here: a restored snapshot always breaches the gate, so every repo
+  # stays 'idle' and wait_repo_ready can never succeed. The job waits for
+  # readiness, so the gate must be off.
+  export CODESEARCH_WARMUP_MAX_AGE_DAYS="${CODESEARCH_WARMUP_MAX_AGE_DAYS:-0}"
+
   # Run serve locally (no ingress needed) just to drive the indexing API.
   codesearch serve --host 127.0.0.1 --port "${PORT}" --no-tui --quiet=false &
   local serve_pid=$!
@@ -809,16 +944,19 @@ run_index_job() {
     #   empty     → best-effort prune (see prune_dead_vendor) and skip; a single
     #               dead vendor must not veto the batch, which also carries every
     #               healthy vendor's fresh deltas. Only die if NONE are healthy.
-    #   no graph  → FATAL. The index has content but is unsearchable, and unlike
-    #               "empty" this is not the vendor's fault — pruning it would
-    #               silently delete a healthy corpus to work around a build
-    #               failure, and uploading it would publish a dead index over a
-    #               good snapshot. Abort and keep the previous snapshot.
+    #   no graph  → one force-reindex repair attempt (old-format graph from a
+    #               pre-upgrade snapshot), then FATAL — never publish an
+    #               unsearchable index over a good snapshot, and never prune a
+    #               healthy corpus to work around a build failure.
     vrc=0; verify_index_ready "${vname}" || vrc=$?
     case "${vrc}" in
       0) found=1 ;;
       "${VERIFY_EMPTY}") prune_dead_vendor "${vname}" ;;
-      *) die "vendor '${vname}' has chunks but no HNSW graph — refusing to upload an unsearchable index over the good snapshot" ;;
+      "${VERIFY_NO_GRAPH}")
+        repair_vendor_graph "${vname}" \
+          || die "vendor '${vname}': force rebuild could not produce a searchable index — refusing to upload over the good snapshot"
+        found=1 ;;
+      *) die "vendor '${vname}': unexpected verify state (${vrc}) — refusing to snapshot" ;;
     esac
   done
   [ "${found}" -eq 1 ] \
@@ -827,10 +965,12 @@ run_index_job() {
     rebuild_repo "${KB_DIR}"
     wait_repo_ready "$(basename "${KB_DIR}")" \
       || die "custom-kb never became ready within ${INDEX_JOB_REPO_READY_SECS}s — refusing to snapshot a possibly mid-warmup index over the good one"
-    # custom-kb is not prunable — it is the curated corpus, so ANY verify failure
-    # (empty or missing graph) aborts rather than publishing over a good snapshot.
+    # custom-kb is not prunable — it is the curated corpus. An old-format graph
+    # gets one force-reindex repair; anything still failing aborts rather than
+    # publishing over a good snapshot.
     verify_index_ready "$(basename "${KB_DIR}")" \
-      || die "index verification failed for custom-kb (empty or no HNSW graph) — refusing to upload over the good snapshot"
+      || repair_vendor_graph "$(basename "${KB_DIR}")" \
+      || die "index verification failed for custom-kb (empty or no HNSW graph even after a force rebuild) — refusing to upload over the good snapshot"
   fi
   # Stop the local serve BEFORE snapshotting. upload_snapshot tar's the index
   # dir; a live serve can touch LMDB/tantivy files mid-archive → tar exits 1
@@ -920,14 +1060,18 @@ run_serve() {
     # and only do the expensive pull + reindex when the remote SHA actually moved.
     # KB_PULL_INTERVAL_SECS is kept as a safety-net: force a full pull at least that
     # often even if the cheap poll saw nothing (self-heals a failed/missed ls-remote).
-    # ls-remote uses the stored 'origin' remote so the PAT never lands on argv.
+    # ls-remote goes through kb_git: the PAT never lands on argv nor in
+    # .git/config (the stored remote URL is clean since this fix).
     KB_POLL_INTERVAL_SECS="${KB_POLL_INTERVAL_SECS:-30}"
     KB_PULL_INTERVAL_SECS="${KB_PULL_INTERVAL_SECS:-900}"
     ( kb_branch="$(git -C "${KB_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
       secs_since_pull=0
       while sleep "${KB_POLL_INTERVAL_SECS}"; do
         secs_since_pull=$(( secs_since_pull + KB_POLL_INTERVAL_SECS ))
-        remote_sha="$(git -C "${KB_DIR}" ls-remote origin "${kb_branch}" 2>/dev/null | awk 'NR==1{print $1}')"
+        # || true: a failed ls-remote (auth/network) must read as "poll saw
+        # nothing", not kill this subshell — the safety-net forced pull below
+        # self-heals it. Same idiom as local_sha.
+        remote_sha="$(kb_git -C "${KB_DIR}" ls-remote origin "${kb_branch}" 2>/dev/null | awk 'NR==1{print $1}' || true)"
         local_sha="$(git -C "${KB_DIR}" rev-parse HEAD 2>/dev/null || true)"
         force_pull=0
         [ "${secs_since_pull}" -ge "${KB_PULL_INTERVAL_SECS}" ] && force_pull=1

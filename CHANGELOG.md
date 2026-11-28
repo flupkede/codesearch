@@ -14,6 +14,26 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.8.25]
+
+### Fixed
+
+- **The KB git credential is no longer persisted in uploaded snapshots**
+  (privately reported as GHSA-pxrc-5gh7-28qj). The cloud entrypoint authenticated
+  git by splicing the PAT into the clone URL, so every snapshot carried the token
+  in `custom-kb/.git/config` — and since the re-vendor wave, in
+  `repos_meta.git_remote` inside `repos.json` as well. The PAT now flows only
+  through a per-command credential helper (`GIT_PAT`, never on argv), snapshots
+  exclude `.git`, a restored working tree without `.git` is re-attached from a
+  fresh clone, recorded remote URLs are stripped at capture and healed on load,
+  and the restore scrubs `repos.json` (+`.bak`) of embedded credentials.
+  Deployments should rotate the PAT they configured before this fix.
+- Cloud index-job: restored snapshots no longer dead-lock the readiness wait
+  (serve's warmup age gate is pinned off in job mode), indexes whose HNSW graph
+  no longer loads are force-rebuilt and re-verified before upload, repos the
+  idle reaper closed are poked back open, and the Docker build carries the
+  vendored rmcp again.
+
 ## [1.8.24]
 
 ### Added

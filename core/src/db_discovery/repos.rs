@@ -290,6 +290,20 @@ impl ReposConfig {
             self.repo_read_only.remove(&alias);
         }
 
+        // 3c. Credentials must never ride along in repos.json: pre-fix versions
+        //     captured the tokenized origin URL (GHSA-pxrc-5gh7-28qj).
+        for meta in self.repos_meta.values_mut() {
+            if let Some(remote) = &mut meta.git_remote {
+                let stripped = strip_userinfo(remote);
+                if &stripped != remote {
+                    tracing::warn!(
+                        "repos.json: stripped embedded credentials from a recorded git remote"
+                    );
+                    *remote = stripped;
+                }
+            }
+        }
+
         // 4. Prune group members referencing unknown aliases OR unknown remote
         //    peers; drop now-empty groups. A member starting with `@` is a
         //    federation reference to a remote peer (`@cloud`), all others are
@@ -1571,7 +1585,23 @@ pub(crate) fn git_remote_url(path: &Path) -> Option<String> {
     if url.is_empty() {
         None
     } else {
-        Some(url)
+        Some(strip_userinfo(&url))
+    }
+}
+
+/// Credentials must never reach persisted config: `remote.origin.url` may
+/// embed them (`https://user:pat@host/...`) and `repos_meta.git_remote` rides
+/// along in uploaded snapshots (GHSA-pxrc-5gh7-28qj).
+fn strip_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let (scheme, rest) = url.split_at(scheme_end + 3);
+    match rest.find('@') {
+        // Only a userinfo block (no '/' before '@') carries credentials; an
+        // '@' inside the path (https://host/o@r) is left alone.
+        Some(at) if !rest[..at].contains('/') => format!("{scheme}{}", &rest[at + 1..]),
+        _ => url.to_string(),
     }
 }
 
