@@ -14,7 +14,7 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.8.25]
+## [1.8.26]
 
 ### Fixed
 
@@ -34,15 +34,9 @@ finalized in place with a date — no renaming/migration step needed.
   idle reaper closed are poked back open, and the Docker build carries the
   vendored rmcp again.
 
-## [1.8.24]
-
 ### Added
 
 - **`codesearch hooks opencode install`**: the OpenCode integration now has a one-command installer, mirroring `hooks claude install`. The plugin (`integrations/opencode/codesearch.ts`) is embedded in the binary at compile time, so a machine without a source checkout gets the full wiring — user scope (`~/.config/opencode/plugins/`) by default, `--project` for `.opencode/plugins/`. A rerun overwrites the file with the binary's own copy; previously the plugin could only be installed by a manual copy from a source checkout.
-
-## [1.8.12]
-
-### Added
 
 - **Serve's periodic registry heal now also discovers worktrees that were never registered.** The post-checkout hook is fire-and-forget, so a `git worktree add` whose POST lands in a serve restart window (dead port, no listener) leaves no registration and no trace — the worktree stays unsearchable until someone notices. Every `WORKTREE_DISCOVERY_INTERVAL_SECS` (60 s) the status-refresher pass lists the worktrees of each registered repo (`git worktree list --porcelain -z`, one spawn per repo, bare/prunable entries dropped) and routes the roots no alias covers through the ordinary add-repo path — so the throwaway guards, the tombstone refusal and the index build behave exactly as if the hook had fired, and a discovered worktree joins its clone's family identity and worktree-expanding groups automatically. Hook parity is exact: hidden components, OS-temp paths and `index rm --forget` tombstones are skipped silently. Consequence worth knowing: a plain `index rm` of a worktree whose sibling stays registered now returns within one interval (it already returned on that worktree's next checkout); `--forget` is the way to keep one out. The first pass runs one interval after boot, clear of the startup phases.
 
